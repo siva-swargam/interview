@@ -619,6 +619,12 @@ var (
 	cancelAI    context.CancelFunc
 	aiCancelMux sync.Mutex
 
+	// Stream generation counter: incremented on every new stream start.
+	// Each streamAIResponse goroutine captures its own generation at launch
+	// and only clears shared flags if it is still the current generation.
+	streamGeneration uint64
+	streamGenMux     sync.Mutex
+
 	// Audio capture (timer-driven on main thread)
 	pAudioClient   uintptr
 	pCaptureClient uintptr
@@ -1335,7 +1341,7 @@ func connectAssemblyAI() error {
 	params.Add("sample_rate", fmt.Sprintf("%d", SAMPLE_RATE))
 	params.Add("format_turns", "true")
 	params.Add("speech_model", "u3-rt-pro")
-	params.Add("min_turn_silence", "800")  // 800ms silence = end of sentence
+	params.Add("min_turn_silence", "400")  // 400ms silence = end of sentence (faster response)
 	params.Add("max_turn_silence", "3000") // allow 3s pauses within a turn
 
 	wsURL := fmt.Sprintf("%s?%s", ASSEMBLYAI_WS_URL, params.Encode())
@@ -1379,7 +1385,7 @@ func connectAssemblyAI() error {
 		close(audioSendCh) // signals the old drain goroutine to exit
 		audioSendCh = nil
 	}
-	newCh := make(chan []byte, 100)
+	newCh := make(chan []byte, 500)
 	audioSendCh = newCh
 	aaiWSConn = conn
 	aaiConnected = true
@@ -1391,8 +1397,22 @@ func connectAssemblyAI() error {
 	// Using captured conn and newCh prevents races with future reconnects.
 	go func(ch chan []byte, c *websocket.Conn) {
 		for chunk := range ch {
+			// 5-second write deadline: prevents permanent block when TCP send
+			// buffer fills (network congestion / slow AssemblyAI ACK).
+			// Without this the goroutine hangs silently, audioSendCh (cap 100)
+			// fills in ~5 s, every subsequent chunk is dropped via safelySend,
+			// and the app appears to stop listening indefinitely.
+			// 5-second write deadline per chunk. If AssemblyAI's TCP receive
+			// window fills (network hiccup), we give up and close the socket.
+			// DO NOT set aaiWSConn=nil here — that races with the nil check at
+			// the top of handleAssemblyAIResponses's loop, which would cause it
+			// to break without firing reconnect. Instead, just close the socket;
+			// ReadMessage will return an error and handleAssemblyAIResponses will
+			// do the cleanup and reconnect correctly.
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
-				// Connection gone; exit so the reconnect can start a fresh goroutine.
+				fmt.Printf("⚠️ AssemblyAI write error (closing for reconnect): %v\n", err)
+				c.Close() // unblocks ReadMessage → handleAssemblyAIResponses fires reconnect
 				return
 			}
 		}
@@ -1414,42 +1434,23 @@ func connectAssemblyAI() error {
 func handleAssemblyAIResponses() {
 	fmt.Println("👂 AssemblyAI response handler started")
 
-	// Start ping ticker to keep connection alive
-	pingTicker := time.NewTicker(10 * time.Second)
-	defer pingTicker.Stop()
+	// SetPingHandler (set in connectAssemblyAI) already responds to server pings
+	// with pong — that is sufficient keepalive. A separate client-ping goroutine
+	// would call WriteControl concurrently with the drain goroutine's
+	// SetWriteDeadline+WriteMessage, racing on the underlying net.Conn deadline
+	// and randomly corrupting write state. Removed.
 
-	pingDone := make(chan struct{})
-	defer close(pingDone)
-
-	// Run ping in separate goroutine
-	go func() {
-		for {
-			select {
-			case <-pingTicker.C:
-				aaiMutex.RLock()
-				conn := aaiWSConn
-				aaiMutex.RUnlock()
-				if conn == nil {
-					return
-				}
-				// Send ping frame
-				if err := conn.WriteControl(websocket.PingMessage, []byte("keepalive"), time.Now().Add(5*time.Second)); err != nil {
-					fmt.Printf("⚠️ AssemblyAI ping failed: %v\n", err)
-				}
-			case <-pingDone:
-				return
-			}
-		}
-	}()
+	// Capture the connection once. If it gets replaced by a reconnect, ReadMessage
+	// will return an error on this (now-closed) socket, which triggers reconnect.
+	aaiMutex.RLock()
+	conn := aaiWSConn
+	aaiMutex.RUnlock()
+	if conn == nil {
+		fmt.Println("⚠️ handleAssemblyAIResponses: no connection at entry, aborting")
+		return
+	}
 
 	for {
-		aaiMutex.RLock()
-		conn := aaiWSConn
-		aaiMutex.RUnlock()
-		if conn == nil {
-			break
-		}
-
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			// Any error (timeout, close, network) – treat as disconnection.
@@ -1467,7 +1468,21 @@ func handleAssemblyAIResponses() {
 			sessionMutex.Unlock()
 
 			if shouldReconnect {
+				aaiReconnectMux.Lock()
+				alreadyReconnecting := aaiReconnecting
+				if !alreadyReconnecting {
+					aaiReconnecting = true
+				}
+				aaiReconnectMux.Unlock()
+				if alreadyReconnecting {
+					break
+				}
 				go func() {
+					defer func() {
+						aaiReconnectMux.Lock()
+						aaiReconnecting = false
+						aaiReconnectMux.Unlock()
+					}()
 					for attempt := 1; attempt <= 10; attempt++ {
 						sessionMutex.Lock()
 						stillActive := sessionActive
@@ -1534,7 +1549,21 @@ func handleAssemblyAIResponses() {
 			sessionMutex.Unlock()
 
 			if shouldReconnect {
+				aaiReconnectMux.Lock()
+				alreadyReconnecting := aaiReconnecting
+				if !alreadyReconnecting {
+					aaiReconnecting = true
+				}
+				aaiReconnectMux.Unlock()
+				if alreadyReconnecting {
+					break
+				}
 				go func() {
+					defer func() {
+						aaiReconnectMux.Lock()
+						aaiReconnecting = false
+						aaiReconnectMux.Unlock()
+					}()
 					for attempt := 1; attempt <= 10; attempt++ {
 						sessionMutex.Lock()
 						stillActive := sessionActive
@@ -1617,7 +1646,7 @@ func handleTurnMessage(msg AAITurnMessage) {
 
 		go func(transcript string, ctx context.Context) {
 			select {
-			case <-time.After(1000 * time.Millisecond):
+			case <-time.After(300 * time.Millisecond):
 				if transcript != "" {
 					sendToAI(transcript)
 				}
@@ -1629,19 +1658,12 @@ func handleTurnMessage(msg AAITurnMessage) {
 	} else {
 		// ── Partial transcript (user is actively speaking) ────────────────
 		// Only update the display — do NOT cancel pending sends or AI streams.
-		// Cancelling here caused premature mid-sentence sends whenever the user
-		// took a breath, because each breath reset the whole pipeline.
+		// Cancelling the pending send here was the root cause of "stops after 2
+		// questions": the very first partial chunk of Q3 would cancel Q2's
+		// debounced send before it had a chance to fire, so Q2 was never sent.
 		partialMutex.Lock()
 		partialTranscript = msg.Transcript
 		partialMutex.Unlock()
-
-		// Cancel any pending debounced send — user is still speaking
-		pendingSendCancelMux.Lock()
-		if pendingSendCancel != nil {
-			pendingSendCancel()
-			pendingSendCancel = nil
-		}
-		pendingSendCancelMux.Unlock()
 	}
 
 	if hwndMain != 0 {
@@ -1827,28 +1849,30 @@ func audioTick() {
 	}
 
 	// AssemblyAI v3 requires audio chunks between 50ms and 1000ms.
-	// We accumulate 100ms (3200 bytes at 16kHz 16-bit mono) before sending.
-	// The capture timer fires every 20ms, so we only send once we have enough
-	// buffered — this keeps transmission at real-time rate (100ms sent per 100ms).
-	const chunkBytes = SAMPLE_RATE * 2 * 100 / 1000 // 100ms = 3200 bytes
-
-	// Only send one chunk per audioTick call to avoid exceeding real-time rate.
-	audioMutex.Lock()
-	bufLen := len(audioBuffer)
-	if bufLen < chunkBytes {
-		audioMutex.Unlock()
-		return
-	}
-	chunk := make([]byte, chunkBytes)
-	copy(chunk, audioBuffer[:chunkBytes])
-	audioBuffer = audioBuffer[chunkBytes:]
-	audioMutex.Unlock()
+	// We use 50ms (1600 bytes at 16kHz 16-bit mono) — the minimum allowed —
+	// so transcription results arrive with the lowest possible latency.
+	// The capture timer fires every 10ms; we drain all full 50ms chunks that
+	// have accumulated each tick so we never fall behind real-time.
+	const chunkBytes = SAMPLE_RATE * 2 * 50 / 1000 // 50ms = 1600 bytes
 
 	aaiMutex.RLock()
 	ch := audioSendCh
 	aaiMutex.RUnlock()
-	if ch != nil {
-		safelySend(ch, chunk)
+
+	for {
+		audioMutex.Lock()
+		if len(audioBuffer) < chunkBytes {
+			audioMutex.Unlock()
+			break
+		}
+		chunk := make([]byte, chunkBytes)
+		copy(chunk, audioBuffer[:chunkBytes])
+		audioBuffer = audioBuffer[chunkBytes:]
+		audioMutex.Unlock()
+
+		if ch != nil {
+			safelySend(ch, chunk)
+		}
 	}
 }
 
@@ -1900,7 +1924,7 @@ func startSession() {
 
 		// SetTimer with a window handle is safe to call from any thread.
 		if hwndMain != 0 {
-			procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 20, 0)
+			procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 10, 0)
 		}
 
 		isListening = true
@@ -1917,10 +1941,10 @@ func startSession() {
 		// Continuous silence keepalive: always send 100ms of silence every 100ms
 		// when no real audio is in the buffer. This guarantees AssemblyAI never
 		// sees a dead connection, which was causing it to drop the session.
-		const silenceChunkBytes = SAMPLE_RATE * 2 * 100 / 1000 // 100ms = 3200 bytes
-		silenceChunk := make([]byte, silenceChunkBytes)        // zero = silence
+		const silenceChunkBytes = SAMPLE_RATE * 2 * 50 / 1000 // 50ms = 1600 bytes
+		silenceChunk := make([]byte, silenceChunkBytes)       // zero = silence
 		go func() {
-			ticker := time.NewTicker(100 * time.Millisecond)
+			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			for range ticker.C {
 				sessionMutex.Lock()
@@ -1980,18 +2004,24 @@ func stopSession() {
 //  AI Integration (with cancellation)
 // ═══════════════════════════════════════════════════════════════════════════
 
-func streamAIResponse(ctx context.Context, userText string) {
+func streamAIResponse(ctx context.Context, userText string, myGen uint64) {
 	// 60fps refresh while streaming for smooth typing feel
 	procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 16, 0)
 
 	defer func() {
 		procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 500, 0) // back to normal
-		// Cleanup when function exits (finished or cancelled)
-		partialAIResponseMutex.Lock()
-		partialAIResponse = ""
-		partialAIResponseMutex.Unlock()
-		isProcessing = false
-		isAIResponding = false
+		// Only clear shared flags if we are still the current stream.
+		// A stale cancelled goroutine must not overwrite the new stream's state.
+		streamGenMux.Lock()
+		isCurrent := streamGeneration == myGen
+		streamGenMux.Unlock()
+		if isCurrent {
+			partialAIResponseMutex.Lock()
+			partialAIResponse = ""
+			partialAIResponseMutex.Unlock()
+			isProcessing = false
+			isAIResponding = false
+		}
 		if hwndMain != 0 {
 			procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
 		}
@@ -2202,12 +2232,17 @@ func sendToAI(userText string) {
 	cancelAI = cancel
 	aiCancelMux.Unlock()
 
+	streamGenMux.Lock()
+	streamGeneration++
+	myGen := streamGeneration
+	streamGenMux.Unlock()
+
 	// Clear any previous partial response
 	partialAIResponseMutex.Lock()
 	partialAIResponse = ""
 	partialAIResponseMutex.Unlock()
 
-	go streamAIResponse(ctx, userText)
+	go streamAIResponse(ctx, userText, myGen)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
