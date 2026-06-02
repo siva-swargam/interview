@@ -601,15 +601,22 @@ var (
 	partialAIResponse      string
 	partialAIResponseMutex sync.Mutex
 
-	geminiKey         string
-	convMutex         sync.RWMutex
-	isListening       bool
-	isProcessing      bool
-	isAIResponding    bool
+	geminiKey      string
+	convMutex      sync.RWMutex
+	isListening    bool
+	isProcessing   bool
+	isAIResponding bool
+	aiStateMux     sync.Mutex // guards isProcessing and isAIResponding
+
 	currentTranscript string
 	transcriptMutex   sync.RWMutex
 	partialTranscript string
 	partialMutex      sync.RWMutex
+
+	// Deduplication: last transcript actually sent to AI.
+	// Queued/stale Turn messages for already-sent speech are silently dropped.
+	lastSentTranscript    string
+	lastSentTranscriptMux sync.Mutex
 
 	// Session control
 	sessionActive bool
@@ -1339,10 +1346,12 @@ func connectAssemblyAI() error {
 
 	params := url.Values{}
 	params.Add("sample_rate", fmt.Sprintf("%d", SAMPLE_RATE))
+	params.Add("encoding", "pcm_s16le") // required: explicitly declare PCM format
 	params.Add("format_turns", "true")
-	params.Add("speech_model", "u3-rt-pro")
-	params.Add("min_turn_silence", "400")  // 400ms silence = end of sentence (faster response)
-	params.Add("max_turn_silence", "3000") // allow 3s pauses within a turn
+	params.Add("speech_model", "universal-streaming-english") // valid query-param model name
+	params.Add("end_of_turn_confidence_threshold", "0.7")
+	params.Add("min_end_of_turn_silence_when_confident", "400") // correct param name (was "min_turn_silence" which is ignored)
+	params.Add("max_turn_silence", "2400")                      // API default; was 3000 causing 3s delays
 
 	wsURL := fmt.Sprintf("%s?%s", ASSEMBLYAI_WS_URL, params.Encode())
 	headers := http.Header{}
@@ -1396,14 +1405,32 @@ func connectAssemblyAI() error {
 	// Drain goroutine: forwards audio to *this specific connection* only.
 	// Using captured conn and newCh prevents races with future reconnects.
 	go func(ch chan []byte, c *websocket.Conn) {
+		// Wait for the Begin message before forwarding any audio.
+		// Sending audio before the session is confirmed floods the socket
+		// and can cause AssemblyAI to terminate the session early.
+		for {
+			aaiSessionReadyMux.Lock()
+			ready := aaiSessionReady
+			aaiSessionReadyMux.Unlock()
+			if ready {
+				break
+			}
+			// Drain and discard pre-session audio so the channel doesn't fill.
+			select {
+			case _, ok := <-ch:
+				if !ok {
+					return // channel closed (disconnect/reconnect)
+				}
+			default:
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
 		for chunk := range ch {
 			// 5-second write deadline: prevents permanent block when TCP send
 			// buffer fills (network congestion / slow AssemblyAI ACK).
-			// Without this the goroutine hangs silently, audioSendCh (cap 100)
-			// fills in ~5 s, every subsequent chunk is dropped via safelySend,
+			// Without this the goroutine hangs silently, audioSendCh (cap 500)
+			// fills, every subsequent chunk is dropped via safelySend,
 			// and the app appears to stop listening indefinitely.
-			// 5-second write deadline per chunk. If AssemblyAI's TCP receive
-			// window fills (network hiccup), we give up and close the socket.
 			// DO NOT set aaiWSConn=nil here — that races with the nil check at
 			// the top of handleAssemblyAIResponses's loop, which would cause it
 			// to break without firing reconnect. Instead, just close the socket;
@@ -1617,6 +1644,18 @@ func handleTurnMessage(msg AAITurnMessage) {
 		lastSpeechTime = time.Now()
 		lastSpeechMutex.Unlock()
 
+		// Dedup: drop if this exact transcript was already sent to AI.
+		// Slow transcription can deliver the same end_of_turn for buffered audio
+		// that was already processed, causing out-of-sync duplicate messages.
+		finalTranscript := strings.TrimSpace(msg.Transcript)
+		lastSentTranscriptMux.Lock()
+		alreadySent := (lastSentTranscript == finalTranscript && finalTranscript != "")
+		lastSentTranscriptMux.Unlock()
+		if alreadySent {
+			fmt.Printf("🔕 Dropping duplicate transcript: %q\n", finalTranscript)
+			return
+		}
+
 		// Interrupt any in-progress AI stream — user has completed a new utterance
 		aiCancelMux.Lock()
 		if cancelAI != nil {
@@ -1624,18 +1663,19 @@ func handleTurnMessage(msg AAITurnMessage) {
 			cancelAI = nil
 		}
 		aiCancelMux.Unlock()
+
+		aiStateMux.Lock()
 		isProcessing = false
 		isAIResponding = false
+		aiStateMux.Unlock()
 
 		partialAIResponseMutex.Lock()
 		partialAIResponse = ""
 		partialAIResponseMutex.Unlock()
 
-		// ── Debounced send: 200ms after end-of-turn ───────────────────────
+		// ── Debounced send: 300ms after end-of-turn ───────────────────────
 		// pendingSendCancel guards against a newer end-of-turn arriving in
 		// the window; it is the only cancellation mechanism needed here.
-		finalTranscript := msg.Transcript
-
 		pendingSendCancelMux.Lock()
 		if pendingSendCancel != nil {
 			pendingSendCancel()
@@ -1987,8 +2027,10 @@ func stopSession() {
 		cancelAI = nil
 	}
 	aiCancelMux.Unlock()
+	aiStateMux.Lock()
 	isProcessing = false
 	isAIResponding = false
+	aiStateMux.Unlock()
 	isListening = false
 
 	stopAudioDevice()
@@ -2019,8 +2061,10 @@ func streamAIResponse(ctx context.Context, userText string, myGen uint64) {
 			partialAIResponseMutex.Lock()
 			partialAIResponse = ""
 			partialAIResponseMutex.Unlock()
+			aiStateMux.Lock()
 			isProcessing = false
 			isAIResponding = false
+			aiStateMux.Unlock()
 		}
 		if hwndMain != 0 {
 			procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
@@ -2206,8 +2250,15 @@ The candidate will speak the answer out loud, so every word you write should sou
 }
 
 func sendToAI(userText string) {
+	// Record this transcript so duplicates from queued audio are dropped.
+	lastSentTranscriptMux.Lock()
+	lastSentTranscript = strings.TrimSpace(userText)
+	lastSentTranscriptMux.Unlock()
+
+	aiStateMux.Lock()
 	isProcessing = true
 	isAIResponding = true
+	aiStateMux.Unlock()
 
 	// Parse user text (minimal markdown)
 	userSpans := parseMarkdown(userText)
